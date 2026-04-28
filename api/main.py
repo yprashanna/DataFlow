@@ -195,3 +195,107 @@ def pipeline_stats():
     """Aggregated stats per pipeline — useful for dashboards."""
     stats_df = metadata_store.get_pipeline_stats()
     return {"stats": stats_df.to_dict(orient="records")}
+
+
+# ── Test / Debug endpoints (safe to call from browser) ────────────────────────
+
+@app.get("/test/email", tags=["Debug"])
+def test_email_alert():
+    """
+    Sends a test alert email to ALERT_EMAIL_TO.
+    Call this from your browser to verify SMTP config works:
+      GET https://your-api.onrender.com/test/email
+
+    Returns JSON telling you if email is configured and whether send succeeded.
+    """
+    import os
+    alert = AlertManager()
+
+    config_status = {
+        "ALERT_EMAIL_FROM": bool(os.getenv("ALERT_EMAIL_FROM")),
+        "ALERT_EMAIL_TO":   bool(os.getenv("ALERT_EMAIL_TO")),
+        "SMTP_HOST":        os.getenv("SMTP_HOST", "smtp.gmail.com"),
+        "SMTP_PORT":        os.getenv("SMTP_PORT", "587"),
+        "SMTP_USER":        bool(os.getenv("SMTP_USER")),
+        "SMTP_PASSWORD":    bool(os.getenv("SMTP_PASSWORD")),
+        "email_enabled":    alert.email_enabled,
+    }
+
+    if not alert.email_enabled:
+        return {
+            "status": "skipped",
+            "reason": "Email not configured — one or more env vars missing",
+            "config": config_status,
+            "fix": "Set ALERT_EMAIL_FROM, ALERT_EMAIL_TO, SMTP_USER, SMTP_PASSWORD in Render environment",
+        }
+
+    try:
+        alert.send_failure_alert(
+            pipeline_name="test_pipeline",
+            error_message=(
+                "This is a TEST alert from DataFlow.\n"
+                "If you received this, your email alerts are working correctly! ✅\n\n"
+                f"Sent at: {datetime.now(timezone.utc).isoformat()}"
+            ),
+        )
+        return {
+            "status": "sent",
+            "message": f"Test email sent to {os.getenv('ALERT_EMAIL_TO')}",
+            "check": "Check your inbox (and spam folder) for subject: [DataFlow] Pipeline FAILED: test_pipeline",
+            "config": config_status,
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": str(exc),
+            "likely_cause": "Wrong app password, or Gmail 2FA not enabled, or less-secure apps blocked",
+            "config": config_status,
+        }
+
+
+@app.get("/test/pipeline", tags=["Debug"])
+def test_pipeline_run(background_tasks: BackgroundTasks):
+    """
+    Runs the sample_csv_sales pipeline and returns the result synchronously.
+    Use this to verify the full pipeline works end-to-end from your browser.
+      GET https://your-api.onrender.com/test/pipeline
+    """
+    config_file = CONFIGS_DIR / "sample_csv_pipeline.yml"
+    if not config_file.exists():
+        return {"status": "error", "reason": "sample_csv_pipeline.yml not found in configs/"}
+
+    try:
+        from orchestrator.config_parser import load_pipeline_config
+        from orchestrator.runner import PipelineRunner
+        pipeline_config = load_pipeline_config(config_file)
+        runner = PipelineRunner(pipeline_config)
+        result = runner.run()
+        return {
+            "status": result["status"],
+            "rows_ingested": result.get("rows_ingested"),
+            "rows_loaded": result.get("rows_loaded"),
+            "quality_score": result.get("quality_score"),
+            "total_latency_ms": result.get("total_latency_ms"),
+            "error": result.get("error"),
+        }
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+
+
+@app.get("/test/env", tags=["Debug"])
+def test_env_check():
+    """
+    Shows which environment variables are SET (not their values — safe to share).
+    Use this to debug missing config on Render.
+      GET https://your-api.onrender.com/test/env
+    """
+    import os
+    vars_to_check = [
+        "ALERT_EMAIL_FROM", "ALERT_EMAIL_TO",
+        "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD",
+        "DATAFLOW_API_URL",
+    ]
+    return {
+        var: "✅ SET" if os.getenv(var) else "❌ MISSING"
+        for var in vars_to_check
+    }
