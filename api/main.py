@@ -7,12 +7,15 @@ Endpoints:
   GET  /pipelines/{name}/status  → latest status for a pipeline
   GET  /pipelines/{name}/runs    → run history
   GET  /runs                     → all recent runs
-
-Deploy on Render free tier — this whole thing runs in a single uvicorn worker.
+  GET  /stats                    → aggregated stats per pipeline
+  GET  /test/env                 → check env vars are set
+  GET  /test/email               → send a test alert email
+  GET  /test/pipeline            → run sample pipeline synchronously
 """
 
 import logging
-import threading
+import os
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -23,6 +26,7 @@ from pydantic import BaseModel
 
 from monitoring.metadata import MetadataStore
 from monitoring.health import HealthMonitor
+from monitoring.alerts import AlertManager
 from orchestrator.config_parser import load_pipeline_config, list_pipeline_configs
 from orchestrator.runner import PipelineRunner
 
@@ -40,7 +44,6 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-# Allow all origins for local dev / Streamlit Cloud frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -56,7 +59,6 @@ CONFIGS_DIR = Path("configs")
 
 # ── Request / Response models ──────────────────────────────────────────────
 
-
 class PipelineRunResponse(BaseModel):
     run_id: str
     pipeline_name: str
@@ -64,25 +66,10 @@ class PipelineRunResponse(BaseModel):
     message: str
 
 
-class RunResult(BaseModel):
-    run_id: str
-    pipeline_name: str
-    status: str
-    rows_ingested: Optional[int] = None
-    rows_loaded: Optional[int] = None
-    quality_score: Optional[float] = None
-    total_latency_ms: Optional[float] = None
-    error: Optional[str] = None
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
-
-
-# ── Routes ─────────────────────────────────────────────────────────────────
-
+# ── Core routes ────────────────────────────────────────────────────────────
 
 @app.get("/health", tags=["System"])
 def health_check():
-    """System health summary."""
     return {
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -92,36 +79,28 @@ def health_check():
 
 @app.get("/pipelines", tags=["Pipelines"])
 def list_pipelines():
-    """List all pipeline configs discovered in the configs/ directory."""
     config_files = list_pipeline_configs(CONFIGS_DIR)
     pipelines = []
-
     for cf in config_files:
         try:
             cfg = load_pipeline_config(cf)
-            schedule = cfg.get("schedule", {}).get("cron", "manual")
             pipelines.append({
                 "name": cfg["name"],
                 "description": cfg.get("description", ""),
-                "schedule": schedule,
+                "schedule": cfg.get("schedule", {}).get("cron", "manual"),
                 "config_file": cf.name,
             })
         except Exception as exc:
             logger.warning("Could not load config %s: %s", cf, exc)
-
     return {"pipelines": pipelines, "count": len(pipelines)}
 
 
 @app.post("/pipelines/{pipeline_name}/run", tags=["Pipelines"])
 def trigger_pipeline(pipeline_name: str, background_tasks: BackgroundTasks):
-    """Trigger a pipeline run asynchronously. Returns immediately with run_id."""
     config_file = CONFIGS_DIR / f"{pipeline_name}.yml"
-
-    # Also try sample_ prefix
     if not config_file.exists():
         config_file = CONFIGS_DIR / f"sample_{pipeline_name}_pipeline.yml"
     if not config_file.exists():
-        # Search all configs for matching name
         for cf in list_pipeline_configs(CONFIGS_DIR):
             try:
                 cfg = load_pipeline_config(cf)
@@ -130,12 +109,10 @@ def trigger_pipeline(pipeline_name: str, background_tasks: BackgroundTasks):
                     break
             except Exception:
                 continue
-
     if not config_file.exists():
         raise HTTPException(
             status_code=404,
-            detail=f"No config found for pipeline '{pipeline_name}'. "
-                   f"Expected: configs/{pipeline_name}.yml",
+            detail=f"No config found for pipeline '{pipeline_name}'.",
         )
 
     run_id = f"{pipeline_name}_{int(datetime.now(timezone.utc).timestamp())}"
@@ -143,40 +120,30 @@ def trigger_pipeline(pipeline_name: str, background_tasks: BackgroundTasks):
     def _run():
         try:
             pipeline_config = load_pipeline_config(config_file)
-            runner = PipelineRunner(pipeline_config)
-            runner.run()
+            PipelineRunner(pipeline_config).run()
         except Exception as exc:
             logger.error("Background pipeline run failed: %s", exc)
 
     background_tasks.add_task(_run)
-
     return PipelineRunResponse(
         run_id=run_id,
         pipeline_name=pipeline_name,
         status="triggered",
-        message=f"Pipeline '{pipeline_name}' triggered. Poll /pipelines/{pipeline_name}/status for updates.",
+        message=f"Pipeline '{pipeline_name}' triggered.",
     )
 
 
 @app.get("/pipelines/{pipeline_name}/status", tags=["Pipelines"])
 def pipeline_status(pipeline_name: str):
-    """Latest status for a specific pipeline."""
     health = health_monitor.get_pipeline_health(pipeline_name)
     recent = metadata_store.get_recent_runs(pipeline_name=pipeline_name, limit=1)
-
     if recent.empty:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No runs found for pipeline '{pipeline_name}'",
-        )
-
-    last = recent.iloc[0].to_dict()
-    return {"health": health, "last_run": last}
+        raise HTTPException(status_code=404, detail=f"No runs found for pipeline '{pipeline_name}'")
+    return {"health": health, "last_run": recent.iloc[0].to_dict()}
 
 
 @app.get("/pipelines/{pipeline_name}/runs", tags=["Pipelines"])
 def pipeline_runs(pipeline_name: str, limit: int = 20):
-    """Run history for a specific pipeline."""
     runs_df = metadata_store.get_recent_runs(pipeline_name=pipeline_name, limit=limit)
     if runs_df.empty:
         return {"runs": [], "count": 0}
@@ -185,91 +152,101 @@ def pipeline_runs(pipeline_name: str, limit: int = 20):
 
 @app.get("/runs", tags=["Runs"])
 def all_runs(limit: int = 50):
-    """All recent pipeline runs across all pipelines."""
     runs_df = metadata_store.get_recent_runs(limit=limit)
     return {"runs": runs_df.to_dict(orient="records"), "count": len(runs_df)}
 
 
 @app.get("/stats", tags=["System"])
 def pipeline_stats():
-    """Aggregated stats per pipeline — useful for dashboards."""
     stats_df = metadata_store.get_pipeline_stats()
     return {"stats": stats_df.to_dict(orient="records")}
 
 
-# ── Test / Debug endpoints (safe to call from browser) ────────────────────────
+# ── Test / Debug endpoints ─────────────────────────────────────────────────
+
+@app.get("/test/env", tags=["Debug"])
+def test_env_check():
+    """Shows which environment variables are SET. Safe to share — never shows values."""
+    vars_to_check = [
+        "ALERT_EMAIL_FROM", "ALERT_EMAIL_TO",
+        "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD",
+        "DATAFLOW_API_URL",
+    ]
+    return {v: "✅ SET" if os.getenv(v) else "❌ MISSING" for v in vars_to_check}
+
 
 @app.get("/test/email", tags=["Debug"])
 def test_email_alert():
     """
-    Sends a test alert email to ALERT_EMAIL_TO.
-    Call this from your browser to verify SMTP config works:
-      GET https://your-api.onrender.com/test/email
-
-    Returns JSON telling you if email is configured and whether send succeeded.
+    Sends a test alert email and returns the exact result — never returns 500.
+    Open in browser: https://your-api.onrender.com/test/email
     """
-    import os
-    alert = AlertManager()
-
-    config_status = {
-        "ALERT_EMAIL_FROM": bool(os.getenv("ALERT_EMAIL_FROM")),
-        "ALERT_EMAIL_TO":   bool(os.getenv("ALERT_EMAIL_TO")),
-        "SMTP_HOST":        os.getenv("SMTP_HOST", "smtp.gmail.com"),
-        "SMTP_PORT":        os.getenv("SMTP_PORT", "587"),
-        "SMTP_USER":        bool(os.getenv("SMTP_USER")),
-        "SMTP_PASSWORD":    bool(os.getenv("SMTP_PASSWORD")),
-        "email_enabled":    alert.email_enabled,
-    }
-
-    if not alert.email_enabled:
-        return {
-            "status": "skipped",
-            "reason": "Email not configured — one or more env vars missing",
-            "config": config_status,
-            "fix": "Set ALERT_EMAIL_FROM, ALERT_EMAIL_TO, SMTP_USER, SMTP_PASSWORD in Render environment",
-        }
-
     try:
-        alert.send_failure_alert(
-            pipeline_name="test_pipeline",
-            error_message=(
-                "This is a TEST alert from DataFlow.\n"
-                "If you received this, your email alerts are working correctly! ✅\n\n"
-                f"Sent at: {datetime.now(timezone.utc).isoformat()}"
-            ),
-        )
-        return {
-            "status": "sent",
-            "message": f"Test email sent to {os.getenv('ALERT_EMAIL_TO')}",
-            "check": "Check your inbox (and spam folder) for subject: [DataFlow] Pipeline FAILED: test_pipeline",
-            "config": config_status,
+        alert = AlertManager()
+
+        config_info = {
+            "email_from_set": bool(alert.email_from),
+            "email_to_set":   bool(alert.email_to),
+            "smtp_host":      alert.smtp_host,
+            "smtp_port":      alert.smtp_port,
+            "smtp_user_set":  bool(alert.smtp_user),
+            "smtp_pass_set":  bool(alert.smtp_password),
+            "email_enabled":  alert.email_enabled,
         }
+
+        if not alert.email_enabled:
+            return {
+                "status": "skipped",
+                "reason": "One or more required env vars are missing",
+                "config": config_info,
+                "required_vars": ["ALERT_EMAIL_FROM", "ALERT_EMAIL_TO", "SMTP_USER", "SMTP_PASSWORD"],
+            }
+
+        subject = "[DataFlow] Test Alert Email"
+        body = (
+            f"This is a TEST email from DataFlow.\n\n"
+            f"If you received this, your email alerts are working! ✅\n\n"
+            f"Sent at: {datetime.now(timezone.utc).isoformat()}\n"
+            f"From: {alert.email_from}\n"
+            f"To: {alert.email_to}"
+        )
+
+        result = alert.send_email_direct(subject, body)
+
+        if result["sent"]:
+            return {
+                "status": "sent ✅",
+                "message": f"Email delivered to {alert.email_to}",
+                "next_step": "Check your inbox + spam folder for subject: [DataFlow] Test Alert Email",
+                "config": config_info,
+            }
+        else:
+            return {
+                "status": "failed ❌",
+                "error": result.get("error"),
+                "fix": result.get("fix", "Check the error message above"),
+                "config": config_info,
+            }
+
     except Exception as exc:
+        # This outer catch means /test/email NEVER returns HTTP 500
         return {
-            "status": "error",
+            "status": "crashed ❌",
             "error": str(exc),
-            "likely_cause": "Wrong app password, or Gmail 2FA not enabled, or less-secure apps blocked",
-            "config": config_status,
+            "traceback": traceback.format_exc(),
+            "note": "This is an unexpected error — please report this",
         }
 
 
 @app.get("/test/pipeline", tags=["Debug"])
-def test_pipeline_run(background_tasks: BackgroundTasks):
-    """
-    Runs the sample_csv_sales pipeline and returns the result synchronously.
-    Use this to verify the full pipeline works end-to-end from your browser.
-      GET https://your-api.onrender.com/test/pipeline
-    """
+def test_pipeline_run():
+    """Runs sample_csv_sales synchronously and returns the result."""
     config_file = CONFIGS_DIR / "sample_csv_pipeline.yml"
     if not config_file.exists():
         return {"status": "error", "reason": "sample_csv_pipeline.yml not found in configs/"}
-
     try:
-        from orchestrator.config_parser import load_pipeline_config
-        from orchestrator.runner import PipelineRunner
         pipeline_config = load_pipeline_config(config_file)
-        runner = PipelineRunner(pipeline_config)
-        result = runner.run()
+        result = PipelineRunner(pipeline_config).run()
         return {
             "status": result["status"],
             "rows_ingested": result.get("rows_ingested"),
@@ -279,23 +256,4 @@ def test_pipeline_run(background_tasks: BackgroundTasks):
             "error": result.get("error"),
         }
     except Exception as exc:
-        return {"status": "error", "error": str(exc)}
-
-
-@app.get("/test/env", tags=["Debug"])
-def test_env_check():
-    """
-    Shows which environment variables are SET (not their values — safe to share).
-    Use this to debug missing config on Render.
-      GET https://your-api.onrender.com/test/env
-    """
-    import os
-    vars_to_check = [
-        "ALERT_EMAIL_FROM", "ALERT_EMAIL_TO",
-        "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD",
-        "DATAFLOW_API_URL",
-    ]
-    return {
-        var: "✅ SET" if os.getenv(var) else "❌ MISSING"
-        for var in vars_to_check
-    }
+        return {"status": "error", "error": str(exc), "traceback": traceback.format_exc()}

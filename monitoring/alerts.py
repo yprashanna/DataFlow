@@ -1,36 +1,19 @@
-"""Alert manager — sends notifications when pipelines fail or quality degrades.
-
-Currently supports: log-based alerts (always on) and email via SMTP (optional).
-Email needs SMTP creds in .env — if they're missing, we just log loudly.
-# TODO: add Slack webhook support (it's just a POST request)
-"""
+"""Alert manager — sends notifications when pipelines fail or quality degrades."""
 
 import logging
 import os
 import smtplib
+import traceback
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Quality score below this triggers an alert
 QUALITY_ALERT_THRESHOLD = 80.0
 
 
 class AlertManager:
-    """Sends alerts through configured channels.
-
-    Environment variables (all optional — alerts fall back to logs):
-        ALERT_EMAIL_FROM    = sender@example.com
-        ALERT_EMAIL_TO      = ops@example.com
-        SMTP_HOST           = smtp.gmail.com
-        SMTP_PORT           = 587
-        SMTP_USER           = sender@example.com
-        SMTP_PASSWORD       = app_password_here
-    """
-
     def __init__(self):
         self.email_from = os.getenv("ALERT_EMAIL_FROM")
         self.email_to = os.getenv("ALERT_EMAIL_TO")
@@ -43,7 +26,6 @@ class AlertManager:
         ])
 
     def send_failure_alert(self, pipeline_name: str, error_message: str):
-        """Alert when a pipeline fails."""
         subject = f"[DataFlow] Pipeline FAILED: {pipeline_name}"
         body = (
             f"Pipeline '{pipeline_name}' failed at "
@@ -51,34 +33,74 @@ class AlertManager:
             f"Error:\n{error_message}\n\n"
             f"Check the monitoring dashboard for details."
         )
-        self._send(subject, body, level="ERROR")
+        self._send(subject, body)
 
     def send_quality_alert(self, pipeline_name: str, quality_score: float, failed_checks: list):
-        """Alert when data quality score drops below threshold."""
         if quality_score >= QUALITY_ALERT_THRESHOLD:
-            return  # all good, no alert needed
-
+            return
         subject = f"[DataFlow] Quality Alert: {pipeline_name} ({quality_score:.1f}%)"
         check_list = "\n".join(f"  - {c}" for c in failed_checks)
         body = (
             f"Pipeline '{pipeline_name}' quality score dropped to {quality_score:.1f}%\n"
             f"(threshold: {QUALITY_ALERT_THRESHOLD}%)\n\n"
-            f"Failed checks:\n{check_list}\n\n"
-            f"Check the monitoring dashboard for details."
+            f"Failed checks:\n{check_list}"
         )
-        self._send(subject, body, level="WARNING")
+        self._send(subject, body)
 
-    def _send(self, subject: str, body: str, level: str = "INFO"):
-        """Log the alert and optionally email it."""
-        log_fn = logger.error if level == "ERROR" else logger.warning
-        log_fn("ALERT — %s: %s", subject, body)
+    def _send(self, subject: str, body: str):
+        """Log + email. Swallows email errors so pipeline runs are never blocked."""
+        try:
+            logger.warning("ALERT: %s", subject)
+        except Exception:
+            pass  # logging must never crash the caller
 
         if self.email_enabled:
             try:
                 self._send_email(subject, body)
-                logger.info("Alert email sent to %s", self.email_to)
-            except Exception as exc:
-                logger.error("Failed to send alert email: %s", exc)
+            except Exception:
+                pass  # silently swallow — caller uses send_email_direct for explicit testing
+
+    def send_email_direct(self, subject: str, body: str) -> dict:
+        """
+        Send email and RETURN the result dict instead of swallowing errors.
+        Used by the /test/email API endpoint so errors are visible.
+        """
+        if not self.email_enabled:
+            return {
+                "sent": False,
+                "error": "Email not enabled — missing env vars",
+                "missing": [
+                    v for v in ["ALERT_EMAIL_FROM", "ALERT_EMAIL_TO", "SMTP_USER", "SMTP_PASSWORD"]
+                    if not os.getenv(v)
+                ],
+            }
+        try:
+            self._send_email(subject, body)
+            return {"sent": True, "error": None}
+        except smtplib.SMTPAuthenticationError as e:
+            return {
+                "sent": False,
+                "error": f"Authentication failed: {e}",
+                "fix": "Your Gmail app password is wrong. Go to myaccount.google.com → Security → App passwords and regenerate it.",
+            }
+        except smtplib.SMTPException as e:
+            return {
+                "sent": False,
+                "error": f"SMTP error: {e}",
+                "fix": "Check SMTP_HOST=smtp.gmail.com and SMTP_PORT=587",
+            }
+        except OSError as e:
+            return {
+                "sent": False,
+                "error": f"Network error: {e}",
+                "fix": "Render free tier may be blocking outbound SMTP on port 587. Try port 465 with SMTP_PORT=465.",
+            }
+        except Exception as e:
+            return {
+                "sent": False,
+                "error": f"Unexpected error: {e}",
+                "traceback": traceback.format_exc(),
+            }
 
     def _send_email(self, subject: str, body: str):
         msg = MIMEMultipart()
@@ -87,8 +109,9 @@ class AlertManager:
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain"))
 
-        with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+        with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=15) as server:
             server.ehlo()
             server.starttls()
+            server.ehlo()
             server.login(self.smtp_user, self.smtp_password)
             server.sendmail(self.email_from, self.email_to, msg.as_string())
