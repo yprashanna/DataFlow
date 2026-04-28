@@ -1,0 +1,64 @@
+name: weather_open_meteo
+description: >
+  Ingests hourly temperature + wind data from the Open-Meteo API (free, no API key needed).
+  Transforms and loads into the warehouse. Great example of a real working free API pipeline.
+
+schedule:
+  cron: "0 * * * *"   # every hour
+
+halt_on_validation_failure: false
+
+# Open-Meteo weather API — completely free, no auth, no rate-limit issues at this scale
+# Docs: https://open-meteo.com/en/docs
+source:
+  type: api
+  url: "https://api.open-meteo.com/v1/forecast"
+  method: GET
+  params:
+    latitude: 40.7128          # New York City
+    longitude: -74.0060
+    hourly: temperature_2m,windspeed_10m,precipitation,weathercode
+    forecast_days: 3
+    timezone: America/New_York
+  # The hourly data is nested under response["hourly"]
+  json_path: "hourly"
+  timeout: 30
+  retries: 3
+
+validation:
+  checks:
+    - type: row_count
+      min_rows: 24    # at least 24 hours of data
+    - type: not_null
+      columns: [time, temperature_2m]
+      threshold: 0.95
+
+transformation:
+  cleaning:
+    cast_types:
+      temperature_2m: float
+      windspeed_10m: float
+      precipitation: float
+    fill_nulls:
+      windspeed_10m: 0.0
+      precipitation: 0.0
+
+  transforms:
+    - type: add_column
+      name: temp_fahrenheit
+      expression: "temperature_2m * 9/5 + 32"
+
+    - type: bin
+      column: temperature_2m
+      bins: [-50, 0, 10, 20, 30, 60]
+      labels: [freezing, cold, mild, warm, hot]
+      output_column: temp_category
+
+  # No aggregation for this pipeline — keep row-level hourly data
+  aggregation: {}
+
+loading:
+  destination: data/warehouse.db
+  table: weather_forecast_hourly
+  if_exists: replace    # replace with fresh forecast each hour
+  index: false

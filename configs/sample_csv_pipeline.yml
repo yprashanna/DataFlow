@@ -1,0 +1,102 @@
+name: sample_csv_sales
+description: "Ingests the sample sales CSV, validates, cleans, aggregates by region+category, and loads to warehouse."
+
+schedule:
+  cron: "0 6 * * *"   # 6 AM UTC every day
+
+halt_on_validation_failure: false
+
+source:
+  type: csv
+  file_path: data/sample_input.csv
+  delimiter: ","
+  encoding: utf-8
+
+validation:
+  checks:
+    - type: schema
+      expected_columns:
+        - order_id
+        - customer_id
+        - region
+        - category
+        - quantity
+        - unit_price
+        - total_amount
+        - status
+        - sale_date
+
+    - type: not_null
+      columns: [order_id, customer_id, total_amount, status]
+      threshold: 0.98   # allow up to 2% nulls
+
+    - type: range
+      column: unit_price
+      min: 0.01
+      max: 10000.0
+
+    - type: range
+      column: quantity
+      min: 1
+      max: 10000
+
+    - type: accepted_values
+      column: status
+      values: [completed, pending, cancelled, refunded]
+
+    - type: accepted_values
+      column: region
+      values: [North, South, East, West, Central]
+
+    - type: row_count
+      min_rows: 100
+
+transformation:
+  cleaning:
+    drop_nulls: [order_id, customer_id]
+    fill_nulls:
+      rating: 3.0
+      email: "unknown@placeholder.com"
+    strip_whitespace: [product_name, region, category]
+    drop_duplicates:
+      subset: [order_id]
+      keep: first
+    cast_types:
+      quantity: int
+      unit_price: float
+      total_amount: float
+      sale_date: datetime
+    filter_conditions:
+      - "unit_price > 0"
+      - "quantity > 0"
+
+  transforms:
+    - type: add_column
+      name: revenue
+      expression: "quantity * unit_price"
+    - type: extract_date_parts
+      column: sale_date
+      parts: [year, month, quarter, day_of_week]
+    - type: upper
+      column: region
+
+  aggregation:
+    group_by: [region, category, sale_date_year, sale_date_month]
+    aggs:
+      revenue: sum
+      quantity: sum
+      order_id: count
+      unit_price: mean
+      rating: mean
+    rename_aggs:
+      revenue_sum: total_revenue
+      quantity_sum: total_quantity
+      order_id_count: total_orders
+      unit_price_mean: avg_unit_price
+      rating_mean: avg_rating
+
+loading:
+  destination: data/warehouse.db
+  table: sales_regional_agg
+  if_exists: replace
+  index: false

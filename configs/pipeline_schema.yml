@@ -1,0 +1,142 @@
+# DataFlow Pipeline Schema — reference for writing pipeline YAML configs
+# This file documents all supported fields. It is NOT executed.
+
+name: string                    # required — unique identifier, used as table name suffix
+description: string             # optional — human-readable description
+
+schedule:
+  cron: "* * * * *"            # standard 5-field cron — omit for manual-only pipelines
+
+halt_on_validation_failure: false   # if true, pipeline stops on any validation failure
+
+# ── Source ──────────────────────────────────────────────────────────────────
+source:
+  type: csv | api | sqlite      # required
+
+  # CSV options:
+  file_path: path/to/file.csv
+  delimiter: ","
+  encoding: utf-8
+  skip_rows: 0
+  dtype_map:
+    column_name: str | int | float
+
+  # API options:
+  url: https://api.example.com/data
+  method: GET                   # GET | POST
+  params:
+    key: value
+  headers:
+    Authorization: Bearer token
+  json_path: data.items         # dot-path to the list of records in the response
+  timeout: 30
+  retries: 3
+  pagination:
+    param: page                 # query param name for page number
+    start: 1                    # starting page
+    limit: 100                  # records per page
+    max_pages: 10               # safety cap
+
+  # SQLite / DB options:
+  connection_string: sqlite:///data/warehouse.db
+  query: "SELECT * FROM my_table WHERE date > '2024-01-01'"
+  table: my_table               # alternative to query
+
+# ── Validation ──────────────────────────────────────────────────────────────
+validation:
+  checks:
+    - type: not_null
+      columns: [col1, col2]
+      threshold: 0.99           # fraction of non-null rows required (0.0–1.0)
+
+    - type: range
+      column: price
+      min: 0.0
+      max: 99999.99
+
+    - type: unique
+      column: id_column
+
+    - type: schema
+      expected_columns: [id, name, value]
+
+    - type: accepted_values
+      column: status
+      values: [active, inactive, pending]
+
+    - type: regex
+      column: email
+      pattern: "^[\\w.+-]+@[\\w-]+\\.[\\w.]+$"
+
+    - type: row_count
+      min_rows: 1
+
+# ── Transformation ──────────────────────────────────────────────────────────
+transformation:
+  cleaning:
+    drop_nulls: [required_col1, required_col2]
+    fill_nulls:
+      nullable_col: default_value
+    strip_whitespace: [text_col1, text_col2]
+    drop_duplicates:
+      subset: [id_column]
+      keep: first               # first | last | false (drop all dupes)
+    cast_types:
+      date_col: datetime
+      int_col: int
+      float_col: float
+    rename_columns:
+      "Old Column Name": new_column_name
+    filter_conditions:
+      - "price > 0"
+      - "status != 'deleted'"
+
+  transforms:
+    - type: add_column
+      name: new_col
+      expression: "col_a * col_b"     # pandas eval expression
+
+    - type: normalize
+      column: numeric_col
+      method: minmax            # minmax | zscore
+      output_column: col_normalized
+
+    - type: bin
+      column: age
+      bins: [0, 18, 35, 65, 120]
+      labels: [youth, adult, middle_aged, senior]
+      output_column: age_group
+
+    - type: extract_date_parts
+      column: date_col
+      parts: [year, month, quarter, day_of_week, week]
+
+    - type: upper
+      column: text_col
+
+    - type: lower
+      column: text_col
+
+    - type: map_values
+      column: code_col
+      mapping:
+        US: United States
+        UK: United Kingdom
+
+    - type: drop_columns
+      columns: [temp_col, internal_col]
+
+  aggregation:
+    group_by: [dim1, dim2]
+    aggs:
+      metric_col: sum           # sum | mean | count | min | max | std
+    rename_aggs:
+      metric_col_sum: total_metric
+
+# ── Loading ──────────────────────────────────────────────────────────────────
+loading:
+  destination: data/warehouse.db   # path to SQLite file
+  table: target_table_name
+  if_exists: append             # append | replace | fail
+  index: false
+  chunksize: 10000
